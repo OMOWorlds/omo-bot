@@ -13,7 +13,7 @@ function fixture() {
   let voice: string | null = null, gaps = 0, sequence = 0;
   const events: Observation[] = [];
   const collector = new ActivityCollector({ guildId: guild, botId: () => bot, settings: () => settings,
-    channel: id => [channel, other].includes(id) ? { parentId: category, containerId: null } : null,
+    channel: id => [channel, other].includes(id) ? { parentId: category, containerId: null, name: 'general-chat' } : null,
     member: () => member, voiceChannel: () => voice, emit: e => events.push(e), missingMemberBaseline: () => { gaps++; }
   }, () => now);
   const dispatch = (t: string, d: Record<string, unknown>) => collector.handle({ op: 0, t, s: ++sequence, d: { guild_id: guild, ...d } } as GatewayDispatchPayload, `gateway:${sequence}`);
@@ -29,6 +29,8 @@ describe('message observations', () => {
     expect(f.events.map(e => e.type)).toEqual(['message.edited', 'message.deleted']);
     expect(f.events[0]?.before?.content).toBe('Before'); expect(f.events[0]?.after?.content).toBe('After');
     expect(f.events[1]?.before?.content).toBe('After'); expect(f.events[1]?.before?.authorId).toBe(user);
+    expect(f.events[0]?.after?.channelName).toBe('general-chat');
+    expect(f.events[1]?.before?.channelName).toBe('general-chat');
     expect(f.events[1]?.subjectId).toBe(message); expect(f.collector.cachedMessages).toBe(0);
   });
   it('ignores embed/pin/reaction updates and unchanged content including reordered attachments', () => {
@@ -71,9 +73,32 @@ describe('message observations', () => {
     f.advance(MESSAGE_CACHE_TTL); f.collector.syncPolicy(); expect(f.collector.cachedMessages).toBe(0);
     f.create(); f.collector.clear(); expect(f.collector.cachedMessages).toBe(0);
   });
-  it('applies event switches, exclusions, guild scope, policy resets and own-message suppression', () => {
-    const f = fixture(); f.create(); f.setPolicy({ ...f.settings(), events: { ...f.settings().events, 'message.edited': false } });
+  it('retains a saved author and text for deletions after the old 30-minute window', () => {
+    const f = fixture(); f.create(); f.advance(60 * 60 * 1000);
+    f.dispatch('MESSAGE_DELETE', { id: message, channel_id: channel });
+    expect(f.events[0]?.before).toMatchObject({ content: 'Before', authorId: user });
+  });
+  it('preserves eligible snapshots across settings changes and purges newly excluded messages', () => {
+    const f = fixture(); f.create();
+    f.setPolicy({ ...f.settings(), accentColor: '#ffffff', metadataRetentionDays: 7 });
+    f.dispatch('MESSAGE_DELETE', { id: message, channel_id: channel });
+    expect(f.events[0]?.before).toMatchObject({ content: 'Before', authorId: user });
+    f.setPolicy({ ...f.settings(), destinationId: null });
+    f.create(); f.create({ id: '100000000000000031', channel_id: other });
+    f.setPolicy({ ...f.settings(), excludedChannelIds: [channel] });
+    expect(f.collector.cachedMessages).toBe(1);
+    f.dispatch('MESSAGE_DELETE', { id: '100000000000000031', channel_id: other });
+    expect(f.events[1]?.before?.content).toBe('Before');
+    f.setPolicy({ ...f.settings(), excludedChannelIds: [] });
+    f.dispatch('MESSAGE_DELETE', { id: message, channel_id: channel });
+    expect(f.events[2]?.before?.content).toBeNull();
+    f.create();
+    f.setPolicy({ ...f.settings(), events: { ...f.settings().events, 'message.edited': false, 'message.deleted': false } });
     expect(f.collector.cachedMessages).toBe(0);
+  });
+  it('applies event switches, exclusions, guild scope, disabling and own-message suppression', () => {
+    const f = fixture(); f.create(); f.setPolicy({ ...f.settings(), events: { ...f.settings().events, 'message.edited': false } });
+    expect(f.collector.cachedMessages).toBe(1);
     f.create(); f.dispatch('MESSAGE_UPDATE', { id: message, channel_id: channel, content: 'After' }); expect(f.events).toEqual([]);
     f.dispatch('MESSAGE_DELETE', { id: message, channel_id: channel }); expect(f.events).toHaveLength(1);
     for (const patch of [{ excludedChannelIds: [channel] }, { excludedCategoryIds: [category] }, { destinationId: channel }]) {

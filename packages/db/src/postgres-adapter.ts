@@ -32,12 +32,14 @@ export class PostgresAdapter extends PostgresDatabase implements StorageDriver {
       },
       workerPoll: async input => {
         const ids = moduleIds.parse(input.moduleIds), jobs = moduleIds.parse(input.jobModuleIds);
+        if (input.messageCache) await logs.syncMessageCache(input.messageCache);
         const modules = await Promise.all(ids.map(id => core.getModule(id)));
         await core.heartbeat(input.status, input.details);
         const due = await this.query(`SELECT id FROM core_job WHERE guild_id=$1 AND module_id=ANY($2::text[]) AND expires_at>now() AND due_at<=now() AND (state='pending' OR (state='sending' AND lease_until<now())) LIMIT 1`, [guild, jobs]);
         const deliveries = ids.includes('logging') ? await this.query(`SELECT d.id FROM logging_delivery d JOIN logging_event e ON e.id=d.event_id AND e.guild_id=d.guild_id WHERE d.guild_id=$1 AND e.expires_at>now() AND ((d.state='pending' AND d.next_attempt<=now()) OR (d.state='sending' AND d.lease_until<now())) LIMIT 5`, [guild]) : [];
         return { modules, jobsDue: due.length > 0, deliveriesDue: deliveries.length };
       },
+      messageCacheLoad: input => logs.loadMessageCache(input.cursor),
       dashboardSnapshot: async ({ moduleIds: ids }) => {
         const selected = moduleIds.parse(ids);
         return { modules: await Promise.all(selected.map(id => core.getModule(id))), status: await handlers.status({}), events: selected.includes('logging') ? (await logs.list({ limit: 5 })).events : [] };
@@ -60,7 +62,7 @@ export class PostgresAdapter extends PostgresDatabase implements StorageDriver {
         });
         return core.getModule(id);
       },
-      ready: async () => { await this.query('SELECT desired_revision FROM module_config LIMIT 0'); await this.query('SELECT revision FROM module_secret LIMIT 0'); return { protocol: 1, trafficProtocol: 1, secretsProtocol: 1 }; },
+      ready: async () => { await this.query('SELECT desired_revision FROM module_config LIMIT 0'); await this.query('SELECT revision FROM module_secret LIMIT 0'); return { protocol: 1, trafficProtocol: 1, secretsProtocol: 1, messageCacheProtocol: 1 }; },
       workerVerify: async () => { await this.query('SELECT 1'); return null; },
       initialize: async ({ displayName, modules }) => {
         await this.transaction(async client => {

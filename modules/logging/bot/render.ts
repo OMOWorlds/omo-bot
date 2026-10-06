@@ -147,7 +147,8 @@ function activityFields(event: LogEvent): Field[] {
         add('Attachments before', attachments(event.before)); add('Attachments after', attachments(event.after));
       }
     } else {
-      add('Deleted content', text(event.before));
+      add('Deleted content', typeof event.before?.content === 'string' ? text(event.before)
+        : 'Content unavailable. No saved copy was available when Discord reported the deletion; deleted text cannot be fetched afterward.');
       if (Array.isArray(event.before?.attachments) && event.before.attachments.length) add('Attachments', attachments(event.before));
       add('Deleted by', isId(event.actorId) ? `<@${event.actorId}>` : 'Unknown · no confirmed audit evidence');
     }
@@ -177,8 +178,11 @@ export function renderEvent(event: LogEvent, marker: string, accentColor: string
   const test = event.type === 'logging.test';
   const title = Object.hasOwn(titles, event.type) ? titles[event.type]! : 'Activity observed';
   const message = event.type.startsWith('message.'), member = event.type.startsWith('member.') || event.type.startsWith('voice.');
+  const channelName = event.after?.channelName ?? event.before?.channelName;
+  const messageChannel = !isId(event.channelId) ? 'Channel unavailable'
+    : `${typeof channelName === 'string' && channelName ? `${safeText(`#${channelName}`, 200)} · ` : ''}<#${event.channelId}>\nChannel ID: ${event.channelId}`;
   const description = test ? 'Log delivery is working. This test was requested by an administrator.'
-    : message ? isId(event.channelId) ? `<#${event.channelId}>` : 'Channel unavailable'
+    : message ? messageChannel
     : `${member && isId(event.subjectId) ? `<@${event.subjectId}> · ` : ''}${safeText(event.subjectLabel, 200)}${!member && event.type !== 'channel.deleted' && isId(event.channelId) ? ` · <#${event.channelId}>` : ''}`;
   // The footer suffix is used by DiscordTransport.find for retry reconciliation.
   const footer = { text: test ? `Delivery reference · ${marker}` : `${message ? 'Message' : member ? 'Member' : 'Channel'} ID: ${event.subjectId} · ${marker}` };

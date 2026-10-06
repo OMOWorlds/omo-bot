@@ -3,7 +3,7 @@ import type { LogEvent, LoggingEventType } from '../shared/settings.js';
 /** Synthetic examples only. Never sent or saved by the preview endpoint. */
 export function previewEvent(type: LoggingEventType): LogEvent {
   const channel = '100000000000000010', member = '100000000000000002';
-  const message = { authorId: member, authorName: 'Sample member', content: 'The meetup starts at 6.', attachments: [] };
+  const message = { authorId: member, authorName: 'Sample member', channelName: 'sample-channel', content: 'The meetup starts at 6.', attachments: [] };
   const data = { name: 'new-channel', type: 'GuildText', parentId: null, topic: 'A new place for your community.', nsfw: false, slowmode: 0,
     overwrites: [{ id: '100000000000000003', type: 0, allow: ['ViewChannel'], deny: ['ManageChannels'] }] };
   const event: LogEvent = { id: crypto.randomUUID(), type, subjectId: channel, subjectLabel: 'new-channel', channelId: null,

@@ -22,6 +22,26 @@ it('distinguishes unavailable content from empty text and renders safe attachmen
   expect(embed.fields.find(f => f.name === 'After')?.value).toBe('No text content');
   expect(embed.fields.find(f => f.name === 'Attachments after')?.value).not.toContain('@everyone');
 });
+it.each(['message.edited', 'message.deleted'] as const)('identifies the channel for %s without relying on Discord mention resolution', type => {
+  const sample = previewEvent(type);
+  sample.before = { ...sample.before, channelName: 'general-chat' };
+  if (sample.after) sample.after.channelName = 'general-chat';
+  const embed = renderEvent(sample, 'marker', '#bc9cff').embeds[0]!;
+  expect(embed.description).toContain('#general-chat');
+  expect(embed.description).toContain(`Channel ID: ${sample.channelId}`);
+  expect(embed.description).toContain(`<#${sample.channelId}>`);
+});
+it('keeps legacy message events identifiable by channel ID and escapes captured channel names', () => {
+  const sample = previewEvent('message.deleted');
+  sample.before = { content: null };
+  expect(renderEvent(sample, 'marker', '#bc9cff').embeds[0]?.description).toContain(`Channel ID: ${sample.channelId}`);
+  sample.before.channelName = '@everyone **unsafe** <#100000000000000099>';
+  const description = renderEvent(sample, 'marker', '#bc9cff').embeds[0]!.description;
+  expect(description).not.toContain('@everyone');
+  expect(description).not.toContain('<#100000000000000099>');
+  sample.channelId = null;
+  expect(renderEvent(sample, 'marker', '#bc9cff').embeds[0]?.description).toBe('Channel unavailable');
+});
 it('shows nickname removal, added/removed roles and observed voice channels', () => {
   const nickname = previewEvent('member.nickname.updated'); nickname.after = { nickname: null };
   expect(renderEvent(nickname, 'marker', '#bc9cff').embeds[0]?.fields.find(f => f.name === 'After')?.value).toBe('No nickname');

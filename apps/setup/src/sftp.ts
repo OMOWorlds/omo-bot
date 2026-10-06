@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { posix } from 'node:path';
 import { SetupError, type SftpInput } from './model.js';
-export const bundleFiles = ['pb_migrations/1790265600_omo_storage.js', 'pb_migrations/1790265601_instance_binding.js', 'pb_migrations/1790265602_module_resources.js', 'pb_migrations/1790851200_module_secrets.js', 'pb_hooks/000_omo_headless.pb.js', 'pb_hooks/operations.js', 'pb_hooks/installation.js', 'pb_hooks/omo.pb.js'];
+export const bundleFiles = ['pb_migrations/1790265600_omo_storage.js', 'pb_migrations/1790265601_instance_binding.js', 'pb_migrations/1790265602_module_resources.js', 'pb_migrations/1790851200_module_secrets.js', 'pb_hooks/000_omo_headless.pb.js', 'pb_hooks/operations.js', 'pb_hooks/message-cache.js', 'pb_hooks/installation.js', 'pb_hooks/omo.pb.js'];
 const fingerprint = (key: Buffer) => `SHA256:${createHash('sha256').update(key).digest('base64').replace(/=+$/, '')}`;
 // v12 exposes its transport; DefinitelyTyped v9 has not added this public property yet.
 const client = () => new SftpClient('omo-installer', { error: () => {}, end: () => {}, close: () => {} }) as SftpClient & { client: Client };

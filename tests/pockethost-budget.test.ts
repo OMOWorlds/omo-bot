@@ -11,6 +11,9 @@ import type { ModuleState } from '../packages/module-sdk/src/browser.js';
 import type { DeliveryClaim, Operations, SessionRecord } from '../packages/db/src/contracts.js';
 import { createServer } from '../apps/web/src/server.js';
 import { readConfig } from '../packages/core/src/config.js';
+import { ActivityCollector } from '../modules/logging/bot/collect.js';
+import { PersistentMessageCache } from '../modules/logging/bot/message-cache.js';
+import type { GatewayDispatchPayload } from 'discord.js';
 
 // Count actual serialized HTTP requests through the production adapter, not SQL calls or source estimates.
 // In-memory responses model the server; real database semantics are covered by providers.test.ts.
@@ -42,14 +45,23 @@ it('fits 100 delivered changes and one continuously open overview within the sta
   expect(result.peakBurst).toBeLessThanOrEqual(50);
   console.info(`PocketHost budget: 100 changes plus one overview = ${result.total} HTTP requests; maximum rolling 10-second burst = ${result.peakBurst}.`);
 });
+it('persists 1,000 ordinary messages through existing polls without adding per-message requests', async () => {
+  const result = await workload(1, 0, false, 1000);
+  expect(result.cached).toBe(1000);
+  expect(result.calls.messageCacheLoad).toBe(1);
+  expect(result.calls.workerPoll).toBe(120);
+  expect(result.calls.eventCapture ?? 0).toBe(0);
+  expect(result.total).toBeLessThan(350);
+});
 
-async function workload(moduleCount: number, changes: number, dashboard: boolean) {
+async function workload(moduleCount: number, changes: number, dashboard: boolean, messages = 0) {
   vi.useFakeTimers({ toFake: ['Date', 'performance', 'setTimeout', 'clearTimeout'] });
   const guild = '100000000000000001', destination = '100000000000000010';
   const settings = { ...defaultLoggingSettings, destinationId: destination };
   const states = new Map<string, ModuleState>();
   const events: LogEvent[] = [], pending: Array<{ event: LogEvent; delivery: DeliveryClaim }> = [];
   let session: SessionRecord | null = null, sent = 0;
+  const cached = new Set<string>();
   const calls: Record<string, number> = {}, times: number[] = [];
   vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
     const name = _url.split('/').pop() as keyof Operations;
@@ -57,14 +69,18 @@ async function workload(moduleCount: number, changes: number, dashboard: boolean
     calls[name] = (calls[name] ?? 0) + 1; times.push(Date.now());
     let data: unknown = null;
     switch (name) {
-      case 'ready': data = { protocol: 1, trafficProtocol: 1, secretsProtocol: 1 }; break;
+      case 'ready': data = { protocol: 1, trafficProtocol: 1, secretsProtocol: 1, messageCacheProtocol: 1 }; break;
       case 'initialize': for (const module of input.modules) if (!states.has(module.id)) states.set(module.id, {
         moduleId: module.id, settingsVersion: module.settingsVersion, enabled: module.id === 'logging', appliedEnabled: module.id === 'logging',
         settings: module.id === 'logging' ? settings : module.settings, appliedSettings: module.id === 'logging' ? settings : module.settings,
         desiredRevision: 2, appliedRevision: 2, applyError: null
       }); break;
       case 'moduleGet': data = states.get(input.id); break;
-      case 'workerPoll': data = { modules: input.moduleIds.map((id: string) => states.get(id)), jobsDue: false, deliveriesDue: Math.min(pending.length, 5) }; break;
+      case 'workerPoll':
+        for (const id of input.messageCache?.deletes ?? []) cached.delete(id);
+        for (const entry of input.messageCache?.upserts ?? []) cached.add(entry.id);
+        data = { modules: input.moduleIds.map((id: string) => states.get(id)), jobsDue: false, deliveriesDue: Math.min(pending.length, 5) }; break;
+      case 'messageCacheLoad': data = { records: [], nextCursor: null }; break;
       case 'leaseAcquire': case 'leaseRenew': case 'deliveryVerify': data = true; break;
       case 'eventCapture': {
         const event: LogEvent = { id: randomUUID(), type: input.event.type, subjectId: input.event.subjectId, subjectLabel: input.event.label, channelId: input.event.channelId,
@@ -89,10 +105,14 @@ async function workload(moduleCount: number, changes: number, dashboard: boolean
   const lost = vi.fn(), release = await db.singleton(guild, lost);
   const host = new ModuleHost(guild, modules, store, { info() {}, error() {} });
   const worker = new DeliveryWorker(repo, { async validate() {}, async find() { return null; }, async send() { sent++; return destination; } });
-  const cycle = new WorkerCycle(store, host, modules, { health: () => ({ ready: true, status: 'online', details: {} }), afterSync() {},
+  const collector = new ActivityCollector({ guildId: guild, botId: () => destination, settings: () => settings,
+    channel: () => ({ parentId: null, containerId: null }), member: () => null, voiceChannel: () => null, emit() {}, missingMemberBaseline() {} });
+  const messageCache = new PersistentMessageCache(store, collector);
+  const cycle = new WorkerCycle(store, host, modules, { messageCache, health: () => ({ ready: true, status: 'online', details: {} }), afterSync() {},
     catalog: () => store.replaceCatalog([]), report: async () => {}, deliver: limit => worker.drain(limit), loggingCleanup: () => repo.cleanup() });
   // Same one-off storage work as the ready handler, in addition to the maintenance loop.
   await store.replaceCatalog([]); await store.incident('Gateway initialized'); await host.sync();
+  await messageCache.restore();
   const server = dashboard ? await createServer({ db, config: readConfig({ NODE_ENV: 'test', STORAGE_PROVIDER: 'pocketbase', DISCORD_GUILD_ID: guild,
     OWNER_USER_IDS: '100000000000000002', POCKETBASE_URL: 'https://test.pockethost.io', POCKETBASE_SERVICE_KEY: 'a'.repeat(64), DASHBOARD_ORIGIN: 'http://localhost:3000' }),
     demo: true, clientId: 'fixture', encryptionKey: 'b'.repeat(64), identity: { async exchange() { throw new Error('unused'); }, async identity() { throw new Error('unused'); }, async membership(tokens) { return { tokens, roles: [] }; } } }) : null;
@@ -100,6 +120,9 @@ async function workload(moduleCount: number, changes: number, dashboard: boolean
   const cookie = login?.cookies[0];
   try {
     for (let tick = 0; tick < 120; tick++) {
+      for (let i = tick * 10; i < Math.min(messages, (tick + 1) * 10); i++) collector.handle({ op: 0, s: i, t: 'MESSAGE_CREATE', d: {
+        guild_id: guild, channel_id: '100000000000000031', id: String(100000000000001000n + BigInt(i)), author: { id: '100000000000000002', username: 'Member' }, content: 'Ordinary message', attachments: []
+      } } as unknown as GatewayDispatchPayload, `message-${i}`);
       if (tick < changes) await host.dispatch({ guildId: guild, sourceKey: `change-${tick}`, type: 'channel.created', subjectId: '100000000000000030', channelId: '100000000000000030', parentId: null,
         label: 'New channel', observedAt: new Date().toISOString(), before: null, after: { name: 'New channel' } });
       await cycle.tick();
@@ -111,5 +134,5 @@ async function workload(moduleCount: number, changes: number, dashboard: boolean
     }
     expect(lost).not.toHaveBeenCalled();
   } finally { await server?.app.close(); await host.stop(); await store.heartbeat('offline', {}); await release(); await db.close(); }
-  return { calls, sent, total: times.length, peakBurst: Math.max(...times.map(time => times.filter(other => other >= time && other < time + 10000).length)) };
+  return { calls, sent, cached: cached.size, total: times.length, peakBurst: Math.max(...times.map(time => times.filter(other => other >= time && other < time + 10000).length)) };
 }

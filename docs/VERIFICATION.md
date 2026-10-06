@@ -1,6 +1,16 @@
 # Verification record
 
-Updated 2026-10-01. Pinned environment: Node 24.21.0, pnpm 10.34.5, PocketBase 0.40.4 and PostgreSQL 17.10.0. No production credentials or real Discord account were used.
+Updated 2026-10-06. Pinned environment: Node 24.21.0, pnpm 10.34.5, PocketBase 0.40.4 and PostgreSQL 17.10.0. No production credentials or real Discord account were used.
+
+## Persistent message snapshots and channel labels
+
+The 2026-10-06 regressions reproduced lost deletion content after one hour, cache loss on a cosmetic settings change, and message embeds that identified a channel solely through a Discord-resolved mention. The fixes add a 5,000-message/24-hour memory and persistent cache, batched into workerPoll, plus captured channel names and explicit channel IDs.
+
+`pnpm check` passed (78 unit tests and 87 integration tests at that point), as did production/fixture builds, PocketHost bundle generation and all 18 desktop/mobile browser tests. Follow-up paging, category/thread exclusions, old-hook refusal and the 1,000-message HTTP-budget cases passed with typecheck/lint and the affected suites (74 tests), bringing the suite totals to 80 unit and 89 integration cases. Desktop edit and mobile deletion preview screenshots were visually reviewed. The new budget fixture uses the actual adapter, collector, persistent-cache manager and worker cycle with simulated HTTP responses; it confirms 1,000 ordinary messages add no per-message storage requests. This is not a hosted load test.
+
+Real PostgreSQL/PocketBase coverage includes restoration into a fresh collector, author/content preservation through edit/delete, snapshot removals, expiry, the persistent count limit, startup paging, malformed-batch rejection, policy pruning and disabled-write rejection. Unit coverage exercises retries and updates/deletions during an in-flight batch, Unicode request-size limits, restored snapshot expiry and preservation of newer live messages. PocketBase worker ownership also fences cache loads. Existing database migrations remain unchanged; the new hook and matching operations file must be installed before clients requiring messageCacheProtocol:1.
+
+Production deployment, real Gateway resume/replay and live Discord permission/rendering checks were not performed. Initialization/downtime and unflushed changes remain coverage limits; a saved snapshot may predate an unseen edit.
 
 ## Foundation results
 

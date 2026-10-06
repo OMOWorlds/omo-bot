@@ -19,6 +19,8 @@ import { previewEvent } from '../../modules/logging/bot/preview.js';
 import { DeliveryWorker } from '../../modules/logging/bot/delivery.js';
 import { botRegistry } from '../../registry/bot.js';
 import { ActivityCollector } from '../../modules/logging/bot/collect.js';
+import { PersistentMessageCache } from '../../modules/logging/bot/message-cache.js';
+import { MESSAGE_CACHE_PREFIX, MESSAGE_CACHE_TTL, type MessageCacheEntry, type MessageCacheBatch } from '../../modules/logging/shared/message-cache.js';
 import type { GatewayDispatchPayload } from 'discord.js';
 import { createServer } from '../../apps/web/src/server.js';
 import { readConfig } from '../../packages/core/src/config.js';
@@ -42,6 +44,94 @@ describe.each(['postgres', 'pocketbase'] as const)('%s storage contract', provid
   const store = () => driver.scope(guild);
   const repository = () => new LoggingRepository(store());
   async function activate() { const state = await store().updateModule('logging', 1, owner, { enabled: true, settings }); await store().acknowledge('logging', state); }
+  const cachedEntry = (id = '100000000000000099'): MessageCacheEntry => ({ id, channelId: '100000000000000031', parentId: null, containerId: null, savedAt: Date.now(),
+    snapshot: { authorId: owner, authorName: 'Member', content: 'Saved before restart', contentTruncated: false, attachments: [], attachmentsTruncated: false } });
+  const syncCache = (messageCache: MessageCacheBatch) => store().call('workerPoll', { moduleIds: ['logging'], jobModuleIds: [], status: 'online', details: {}, messageCache });
+  const cacheRecords = () => store().call('recordList', { moduleId: 'logging', prefix: MESSAGE_CACHE_PREFIX, cursor: '', limit: 100 });
+  it('restores a fresh collector from durable snapshots and removes deleted snapshots on the next poll', async () => {
+    await activate(); const entry = cachedEntry();
+    await syncCache({ upserts: [entry], deletes: [] });
+    const observations: Observation[] = [];
+    const collector = new ActivityCollector({ guildId: guild, botId: () => destination, settings: () => settings,
+      channel: () => ({ parentId: null, containerId: null, name: 'general-chat' }), member: () => null, voiceChannel: () => null,
+      emit: event => observations.push(event), missingMemberBaseline() {}
+    });
+    const cache = new PersistentMessageCache(store(), collector); await cache.restore();
+    expect(cache.prepare()).toBeUndefined();
+    const dispatch = (t: string, data: Record<string, unknown>) => collector.handle({ op: 0, t, s: 1, d: { guild_id: guild, channel_id: entry.channelId, id: entry.id, ...data } } as GatewayDispatchPayload, t);
+    dispatch('MESSAGE_UPDATE', { content: 'Edited after restart' });
+    expect(observations[0]?.before?.content).toBe('Saved before restart');
+    const batch = cache.prepare()!; await syncCache(batch); cache.acknowledge(batch);
+    expect((await cacheRecords()).records[0]?.value).toMatchObject({ snapshot: { content: 'Edited after restart' } });
+    dispatch('MESSAGE_DELETE', {});
+    expect(observations[1]?.before).toMatchObject({ authorId: owner, content: 'Edited after restart', channelName: 'general-chat' });
+    await syncCache(cache.prepare()!); expect((await cacheRecords()).records).toHaveLength(0);
+    expect((await repository().list({ limit: 10 })).events).toHaveLength(0); // Snapshot writes are not log events.
+  });
+  it('expires snapshots, rejects malformed batches, and cannot resurrect excluded or disabled content', async () => {
+    await activate(); const entry = cachedEntry();
+    await syncCache({ upserts: [entry, { ...entry, id: '100000000000000098', savedAt: Date.now() - MESSAGE_CACHE_TTL }], deletes: [] });
+    expect((await cacheRecords()).records).toHaveLength(1);
+    await expect(syncCache({ upserts: [entry, entry], deletes: [] })).rejects.toThrow();
+    await expect(syncCache({ upserts: [{ ...entry, snapshot: { ...entry.snapshot, content: 'x'.repeat(4001) } }], deletes: [] })).rejects.toThrow();
+    await repository().apply({ ...settings, accentColor: '#ffffff' });
+    expect((await cacheRecords()).records).toHaveLength(1);
+    const excluded = { ...settings, excludedChannelIds: [entry.channelId] };
+    await repository().apply(excluded);
+    const state = await store().updateModule('logging', 2, owner, { settings: excluded }); await store().acknowledge('logging', state);
+    await syncCache({ upserts: [entry], deletes: [] }); expect((await cacheRecords()).records).toHaveLength(0);
+    const enabled = await store().updateModule('logging', 3, owner, { settings }); await store().acknowledge('logging', enabled);
+    await syncCache({ upserts: [entry], deletes: [] });
+    await repository().cancelPending(); expect((await cacheRecords()).records).toHaveLength(0);
+    await store().updateModule('logging', 4, owner, { enabled: false });
+    await syncCache({ upserts: [entry], deletes: [] }); expect((await cacheRecords()).records).toHaveLength(0);
+  });
+  it('enforces the persistent snapshot cap and TTL independently of the bot memory cache', async () => {
+    await activate(); const entry = cachedEntry();
+    const value = JSON.stringify(entry);
+    if (provider === 'postgres') await (driver as Database).query(`INSERT INTO module_record(guild_id,module_id,key,value,expires_at)
+      SELECT $1,'logging','message-cache:'||(100000000000001000::bigint+n)::text,$2::jsonb,now()+interval '1 hour' FROM generate_series(0,4999) AS n`, [guild, value]);
+    else {
+      const sqlite = new DatabaseSync(`${pb!.directory}/pb_data/data.db`);
+      try {
+        sqlite.prepare(`WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x<4999)
+          INSERT INTO omo_module_record(guild_id,module_id,key,value,updated_at,expires_at)
+          SELECT ?,'logging','message-cache:'||CAST(100000000000001000+x AS TEXT),?,?,? FROM n`).run(guild, value, Date.now(), Date.now() + 3600000);
+      } finally { sqlite.close(); }
+    }
+    await syncCache({ upserts: [entry], deletes: [] });
+    let count: number;
+    if (provider === 'postgres') count = (await (driver as Database).query<{ count: number }>(`SELECT count(*)::int AS count FROM module_record WHERE guild_id=$1 AND module_id='logging'`, [guild]))[0]!.count;
+    else {
+      const sqlite = new DatabaseSync(`${pb!.directory}/pb_data/data.db`);
+      try { count = (sqlite.prepare("SELECT count(*) AS count FROM omo_module_record WHERE module_id='logging'").get() as { count: number }).count; } finally { sqlite.close(); }
+    }
+    expect(count).toBe(5000);
+    const first = await store().call('messageCacheLoad', { cursor: '' });
+    expect(first.records).toHaveLength(500); expect(first.nextCursor).toBeTruthy();
+    const second = await store().call('messageCacheLoad', { cursor: first.nextCursor! });
+    expect(second.records).toHaveLength(500);
+    expect(new Set([...first.records, ...second.records].map(record => record.key)).size).toBe(1000);
+    await mutateForTest("UPDATE module_record SET expires_at=now()-interval '1 second'", 'UPDATE omo_module_record SET expires_at=0');
+    expect((await cacheRecords()).records).toHaveLength(0);
+    await syncCache({ upserts: [], deletes: [] });
+    expect((await cacheRecords()).records).toHaveLength(0);
+  });
+  it('prunes persistent snapshots for category, thread-parent, destination and message-switch exclusions', async () => {
+    await activate();
+    const entry = { ...cachedEntry(), parentId: '100000000000000041', containerId: '100000000000000042' };
+    for (const policy of [
+      { ...settings, excludedCategoryIds: [entry.parentId] },
+      { ...settings, excludedChannelIds: [entry.containerId] },
+      { ...settings, destinationId: entry.channelId },
+      { ...settings, events: { ...settings.events, 'message.edited': false, 'message.deleted': false } }
+    ]) {
+      await syncCache({ upserts: [entry], deletes: [] });
+      expect((await cacheRecords()).records).toHaveLength(1);
+      await repository().apply(policy);
+      expect((await cacheRecords()).records).toHaveLength(0);
+    }
+  });
   it('collects immediate deletions and new-member role updates through the installed production module', async () => {
     const sharedStore = store(), repo = new LoggingRepository(sharedStore);
     const host = new ModuleHost(guild, botRegistry(repo, async () => {}, true), sharedStore, { info() {}, error() {} });
@@ -401,6 +491,7 @@ describe.each(['postgres', 'pocketbase'] as const)('%s storage contract', provid
       try {
         await expect(store().call('workerVerify', {})).rejects.toMatchObject({ statusCode: 409 });
         await expect(store().call('workerPoll', { moduleIds: ['logging'], jobModuleIds: [], status: 'online', details: {} })).rejects.toMatchObject({ code: 'LEASE_LOST' });
+        await expect(store().call('messageCacheLoad', { cursor: '' })).rejects.toMatchObject({ code: 'LEASE_LOST' });
         await expect(store().call('deliveryPrepare', {})).rejects.toMatchObject({ code: 'LEASE_LOST' });
         await expect(store().call('deliveryVerify', { id: randomUUID(), claimToken: randomUUID(), revision: 2 })).rejects.toMatchObject({ code: 'LEASE_LOST' });
         await release!(); release = undefined;

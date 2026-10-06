@@ -1,6 +1,14 @@
 # Implementation handoff
 
-Updated 2026-10-01. OMOBot is a modular, self-hostable Discord bot by OMOWorlds, released under Apache 2.0. One deployment serves one configured guild. README is the public entry point; ROADMAP records unfinished work.
+Updated 2026-10-06. OMOBot is a modular, self-hostable Discord bot by OMOWorlds, released under Apache 2.0. One deployment serves one configured guild. README is the public entry point; ROADMAP records unfinished work.
+
+## Persistent message cache and channel identification (2026-10-06)
+
+Message comparison now keeps up to 5,000 snapshots for 24 hours in memory and the selected database. Changed snapshots/removals travel with workerPoll, with 100-snapshot/512-KiB batch limits. Startup restores pages of 500; clean shutdown flushes pending batches. Failed writes remain retryable, and acknowledgements cannot erase a newer in-memory update. Cosmetic settings preserve eligible snapshots; exclusions and disabling message logging prune them. Resumable Gateway reconnects keep the baseline and consume replayed raw events. Crashes, downtime, expiry and count eviction still limit coverage.
+
+Message embeds capture the channel name and show the channel ID alongside the mention, so “No Access” is no longer the only channel identifier. This does not alter Discord permissions. Unavailable deleted text is explained explicitly and cannot be recovered retroactively.
+
+Both providers use their existing module-record tables. PocketBase needs updated `operations.js` plus new `message-cache.js`; clients require messageCacheProtocol:1. No new migration or key is needed. Builds, typecheck/lint, database regressions and 18 browser tests pass locally; see docs/VERIFICATION.md for counts and limits. No production rollout or live Discord acceptance was performed.
 
 ## Current implementation
 
@@ -64,7 +72,7 @@ The activity-logging update passed typecheck, lint, 52 unit tests, 61 database/i
 - Enable Server Members and Message Content privileged intents in the Discord application before starting this version, even when new event switches are off. Deploy matching bot and dashboard builds. The earlier activity-collector update needed no storage changes; the current request-budget release requires updated hooks.
 - The raw Gateway collector runs before discord.js updates member/voice caches. Preserve that ordering. Member baseline fetching is bounded to 15 seconds; missing baselines record gaps instead of fabricated changes.
 - Collector policy comes from `ModuleHost.activeSettings('logging')`. Do not restore repository-local policy state: package factories can create their own repository objects. Ordinary new messages remain memory-only. Member join/leave events are not implemented; initial roles already present in a join snapshot are not fabricated as role changes.
-- Discord.js MessageManager caching is explicitly disabled. The logging collector alone holds up to 1,000 messages for 30 minutes, with 4,000 content characters and ten attachment names per snapshot. Cache state clears on applied-policy changes, disconnect and shutdown; only edits/deletions persist content under event retention. Module message subscribers still receive live message content.
+- Discord.js MessageManager caching is explicitly disabled. The logging collector holds up to 5,000 messages for 24 hours, with 4,000 content characters and ten attachment names per snapshot. A matching persistent cache batches changes into workerPoll and restores them at startup. Disabling message logging or excluding a channel removes its snapshots; cosmetic policy changes and resumable reconnects preserve them. Snapshots and edit/deletion events have separate retention periods. The persistent-cache release requires updated PocketBase hooks advertising messageCacheProtocol:1, without a new schema migration. Module message subscribers still receive live message content.
 - Message/voice subjects are not channel IDs. Exclusion checks must use channelId, category and snapshot containerId (for thread parents), both before collection and before delivery. The existing PocketBase hooks persist generic events; the delivery worker performs the additional exclusion/event-switch recheck.
 - Use the pinned Node/pnpm versions. Runtime profiles, `.env`, databases, dependencies, builds and screenshots are ignored by Git.
 - Keep migrations immutable. PocketBase uses private `omo_` SQL tables behind authenticated hooks, not public collections. Upload the complete hook/migration bundle.

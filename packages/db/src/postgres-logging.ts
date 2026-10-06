@@ -4,6 +4,9 @@ import type { PostgresGuildStore } from './postgres.js';
 import type { Observation } from '../../module-sdk/src/server.js';
 import { filterEventTypes, loggingSettingsSchema, type LoggingSettings, type LogEvent } from '../../../modules/logging/shared/settings.js';
 import { HttpError } from '../../core/src/access.js';
+import type { PoolClient } from 'pg';
+import type { ModuleRecord } from '../../module-sdk/src/services.js';
+import { MESSAGE_CACHE_PREFIX, MESSAGE_CACHE_LIMIT, MESSAGE_CACHE_TTL, messageCacheBatchSchema, cacheEntryAllowed, type MessageCacheBatch } from '../../../modules/logging/shared/message-cache.js';
 
 const selection = `e.id,e.type,e.subject_id AS "subjectId",e.subject_label AS "subjectLabel",e.channel_id AS "channelId",e.parent_id AS "parentId",
   e.observed_at AS "observedAt",e.before_value AS before,e.after_value AS after,e.actor_id AS "actorId",e.reason,e.attribution,
@@ -15,6 +18,41 @@ export const eventFilter = z.object({
 }).strict();
 export class PostgresLoggingRepository {
   constructor(readonly store: PostgresGuildStore) {}
+  async loadMessageCache(cursor: string) {
+    z.string().regex(/^(message-cache:\d{17,20})?$/).parse(cursor);
+    const records = await this.store.db.query<ModuleRecord>(`SELECT key,value,revision,updated_at AS "updatedAt" FROM module_record
+      WHERE guild_id=$1 AND module_id='logging' AND key LIKE $2 AND key COLLATE "C">$3 AND expires_at>now() ORDER BY key COLLATE "C" LIMIT 501`,
+    [this.store.guildId, `${MESSAGE_CACHE_PREFIX}%`, cursor]);
+    const more = records.length > 500; if (more) records.pop();
+    return { records, nextCursor: more ? records.at(-1)!.key : null };
+  }
+  private async pruneMessageCache(client: PoolClient, settings: LoggingSettings | null) {
+    await client.query(`DELETE FROM module_record WHERE guild_id=$1 AND module_id='logging' AND key LIKE $2 AND
+      (expires_at<=now() OR $3::boolean OR value->>'channelId'=$4 OR value->>'id'=ANY($5::text[])
+      OR value->>'channelId'=ANY($5::text[]) OR value->>'containerId'=ANY($5::text[])
+      OR value->>'id'=ANY($6::text[]) OR value->>'parentId'=ANY($6::text[]))`,
+    [this.store.guildId, `${MESSAGE_CACHE_PREFIX}%`, !settings || !(settings.events['message.edited'] || settings.events['message.deleted']),
+      settings?.destinationId ?? null, settings?.excludedChannelIds ?? [], settings?.excludedCategoryIds ?? []]);
+  }
+  async syncMessageCache(input: MessageCacheBatch) {
+    const batch = messageCacheBatchSchema.parse(input), now = Date.now();
+    await this.store.db.transaction(async client => {
+      const module = (await client.query(`SELECT enabled,applied_enabled,applied_settings FROM module_config WHERE guild_id=$1 AND module_id='logging' FOR UPDATE`, [this.store.guildId])).rows[0];
+      const settings = module?.enabled && module.applied_enabled ? loggingSettingsSchema.parse(module.applied_settings) : null;
+      await this.pruneMessageCache(client, settings);
+      await client.query(`DELETE FROM module_record WHERE guild_id=$1 AND module_id='logging' AND key=ANY($2::text[])`,
+        [this.store.guildId, batch.deletes.map(id => `${MESSAGE_CACHE_PREFIX}${id}`)]);
+      const entries = batch.upserts.filter(entry => entry.savedAt <= now && now - entry.savedAt < MESSAGE_CACHE_TTL && cacheEntryAllowed(entry, settings));
+      if (entries.length) await client.query(`INSERT INTO module_record(guild_id,module_id,key,value,expires_at)
+        SELECT $1,'logging',$2||(entry->>'id'),entry,to_timestamp(((entry->>'savedAt')::bigint+$4)/1000.0)
+        FROM jsonb_array_elements($3::jsonb) AS entry
+        ON CONFLICT(guild_id,module_id,key) DO UPDATE SET value=EXCLUDED.value,expires_at=EXCLUDED.expires_at,revision=module_record.revision+1,updated_at=now()`,
+      [this.store.guildId, MESSAGE_CACHE_PREFIX, JSON.stringify(entries), MESSAGE_CACHE_TTL]);
+      await client.query(`DELETE FROM module_record WHERE guild_id=$1 AND module_id='logging' AND key IN
+        (SELECT key FROM module_record WHERE guild_id=$1 AND module_id='logging' AND key LIKE $2 ORDER BY expires_at DESC,key DESC OFFSET $3)`,
+      [this.store.guildId, `${MESSAGE_CACHE_PREFIX}%`, MESSAGE_CACHE_LIMIT]);
+    });
+  }
   excluded(event: { subjectId: string; parentId: string | null }, settings: LoggingSettings): boolean {
     return settings.excludedChannelIds.includes(event.subjectId) || settings.excludedCategoryIds.includes(event.subjectId) || (event.parentId !== null && settings.excludedCategoryIds.includes(event.parentId));
   }
@@ -56,6 +94,7 @@ export class PostgresLoggingRepository {
   async apply(settings: LoggingSettings) {
     // Update pending routes and policy atomically. Stored metadata still follows retention.
     await this.store.db.transaction(async client => {
+      await this.pruneMessageCache(client, settings);
       await client.query(`UPDATE logging_event SET expires_at=LEAST(expires_at,observed_at+($2::int*interval '1 day')) WHERE guild_id=$1`, [this.store.guildId, settings.metadataRetentionDays]);
       await client.query(`UPDATE logging_delivery d SET state='cancelled',lease_until=NULL FROM logging_event e
         WHERE d.guild_id=$1 AND e.id=d.event_id AND d.state IN ('pending','blocked','failed','sending') AND
@@ -66,7 +105,10 @@ export class PostgresLoggingRepository {
     });
   }
   async cancelPending() {
-    await this.store.db.query(`UPDATE logging_delivery SET state='cancelled',lease_until=NULL WHERE guild_id=$1 AND state IN ('pending','blocked','failed','sending')`, [this.store.guildId]);
+    await this.store.db.transaction(async client => {
+      await this.pruneMessageCache(client, null);
+      await client.query(`UPDATE logging_delivery SET state='cancelled',lease_until=NULL WHERE guild_id=$1 AND state IN ('pending','blocked','failed','sending')`, [this.store.guildId]);
+    });
   }
   async cleanup() { await this.store.db.query('DELETE FROM logging_event WHERE guild_id=$1 AND expires_at<=now()', [this.store.guildId]); }
   async activeSettings(): Promise<{ settings: LoggingSettings; revision: number; enabled: boolean }> {

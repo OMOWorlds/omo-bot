@@ -13,6 +13,7 @@ import { DeliveryWorker } from '../../../modules/logging/bot/delivery.js';
 import { botRegistry } from '../../../registry/bot.js';
 import { channelData, discordTransport, destinationPermissions } from './discord.js';
 import { ActivityCollector } from '../../../modules/logging/bot/collect.js';
+import { PersistentMessageCache } from '../../../modules/logging/bot/message-cache.js';
 import type { LoggingSettings } from '../../../modules/logging/shared/settings.js';
 
 export async function startBot(config: Config, token: string) {
@@ -26,7 +27,7 @@ export async function startBot(config: Config, token: string) {
   const transport = discordTransport(client, store.guildId), repository = new LoggingRepository(store);
   const modules = botRegistry(repository, transport.validate, config.NODE_ENV === 'production');
   await store.initialize(config.COMMUNITY_NAME, modules);
-  let stopped = false, ready = false, sequence = 0, dropped = 0;
+  let stopped = false, ready = false, initialized = false, sequence = 0, dropped = 0;
   let lastStorageSuccess = 0;
   let reportedFailures = 0;
   let missingMemberBaselines = 0;
@@ -45,8 +46,8 @@ export async function startBot(config: Config, token: string) {
       const channel = client.channels.cache.get(id);
       if (!channel || !('guild' in channel) || channel.guild.id !== store.guildId) return null;
       if (channel.isThread() && !channel.parent) return null;
-      return channel.isThread() ? { parentId: channel.parent?.parentId ?? null, containerId: channel.parentId }
-        : { parentId: channel.parentId, containerId: null };
+      return channel.isThread() ? { parentId: channel.parent?.parentId ?? null, containerId: channel.parentId, name: channel.name }
+        : { parentId: channel.parentId, containerId: null, name: channel.name };
     },
     member(id) {
       const member = client.guilds.cache.get(store.guildId)?.members.cache.get(id);
@@ -56,8 +57,10 @@ export async function startBot(config: Config, token: string) {
     emit(event) { void host.dispatch(event).catch(() => { dropped++; }); },
     missingMemberBaseline() { missingMemberBaselines++; }
   });
+  const messageCache = new PersistentMessageCache(store, activity);
   client.on(Events.Raw, packet => {
-    if (stopped || !ready) return;
+    // Resumed sessions replay messages before ShardResume. Keep the baseline and consume that replay.
+    if (stopped || !initialized) return;
     try { activity.handle(packet, `${generation}:gateway:${packet.s ?? ++sequence}`); }
     catch { dropped++; }
   });
@@ -110,14 +113,14 @@ export async function startBot(config: Config, token: string) {
       });
     })().catch(() => { console.error('Module message dispatch failed.'); });
   });
-  client.on(Events.ShardDisconnect, () => { ready = false; activity.clear(); });
-  client.on(Events.ShardResume, () => { ready = true; });
-  client.on(Events.Error, () => { ready = false; activity.clear(); console.error('Discord connection error. Check configuration and dashboard health.'); });
+  client.on(Events.ShardDisconnect, () => { ready = false; });
+  client.on(Events.ShardResume, () => { ready = initialized; });
+  client.on(Events.Error, () => { ready = false; console.error('Discord connection error. Check configuration and dashboard health.'); });
   let timer: ReturnType<typeof setTimeout> | undefined;
   const cycle = new WorkerCycle(store, host, modules, {
     health: () => ({ ready, status: ready ? host.failures || dropped || missingMemberBaselines ? 'degraded' : 'online' : 'offline',
       details: { gateway: ready, persistenceFailures: host.failures, capabilities: ['channels', 'message-edits-deletions', 'member-nicknames-roles', 'voice-joins-leaves'] } }),
-    afterSync: () => activity.syncPolicy(), catalog, deliver: limit => worker.drain(limit), loggingCleanup: () => repository.cleanup(),
+    messageCache, afterSync: () => activity.syncPolicy(), catalog, deliver: limit => worker.drain(limit), loggingCleanup: () => repository.cleanup(),
     async report() {
       if (host.failures > reportedFailures) { await store.incident('Observation processing failed; these observations may not have been committed.', host.failures - reportedFailures); reportedFailures = host.failures; }
       if (dropped) { await store.incident('Observation queue overflow; events were not committed.', dropped); dropped = 0; }
@@ -129,14 +132,16 @@ export async function startBot(config: Config, token: string) {
     try {
       await cycle.tick();
       lastStorageSuccess = Date.now();
-    } catch (error) { ready = client.isReady(); console.error('Worker tick failed.', error instanceof HttpError ? error.message : 'Storage or Discord may be unavailable.'); }
+    } catch (error) { ready = initialized && client.isReady(); console.error('Worker tick failed.', error instanceof HttpError ? error.message : 'Storage or Discord may be unavailable.'); }
     finally { if (!stopped) timer = setTimeout(() => { activeTick = tick(); }, pollMs); }
   };
   client.on(Events.ClientReady, () => {
     void (async () => {
-      ready = false; activity.clear(); await catalog();
-      await store.incident('Gateway initialized; activity during downtime cannot be reconstructed. Message comparison cache starts empty.');
+      ready = false; await catalog();
+      await store.incident('Gateway initialized; saved message snapshots are restored, but activity during downtime and unflushed changes cannot be reconstructed.');
       await host.sync();
+      if (!initialized) await messageCache.restore();
+      initialized = true;
       if (client.options.intents.has('GuildMembers')) {
         try { await client.guilds.cache.get(store.guildId)?.members.fetch({ time: 15000 }); }
         catch { await store.incident('Member baseline loading was incomplete; some nickname/role changes may lack a previous snapshot.'); }
@@ -146,5 +151,17 @@ export async function startBot(config: Config, token: string) {
   });
   try { await client.login(token); activeTick = tick(); }
   catch { health.close(); await release(); await db.close(); client.destroy(); throw new Error('Discord login failed. Check the bot token and configured intents.'); }
-  return async () => { stopped = true; activity.clear(); if (timer) clearTimeout(timer); client.destroy(); health.close(); await activeTick; await host.stop(); try { await store.heartbeat('offline', {}); } finally { await release(); await db.close(); } };
+  return async () => {
+    stopped = true; if (timer) clearTimeout(timer); client.destroy(); health.close(); await activeTick;
+    try {
+      // A clean shutdown saves the remaining bounded batches before releasing worker ownership.
+      for (let batch = messageCache.prepare(); batch; batch = messageCache.prepare()) {
+        await store.call('workerPoll', { moduleIds: [], jobModuleIds: [], status: 'offline', details: {}, messageCache: batch });
+        messageCache.acknowledge(batch);
+      }
+    } finally {
+      activity.clear(); await host.stop();
+      try { await store.heartbeat('offline', {}); } finally { await release(); await db.close(); }
+    }
+  };
 }

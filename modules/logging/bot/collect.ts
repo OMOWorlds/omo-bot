@@ -2,8 +2,10 @@ import type { GatewayDispatchPayload, GatewayMessageUpdateDispatchData } from 'd
 import type { Observation } from '../../../packages/module-sdk/src/server.js';
 import type { LoggingSettings } from '../shared/settings.js';
 import { eventEnabled, excludedEvent } from '../shared/policy.js';
+import { MESSAGE_CACHE_LIMIT, MESSAGE_CACHE_TTL, type MessageCacheEntry, type MessageSnapshot } from '../shared/message-cache.js';
+export { MESSAGE_CACHE_LIMIT, MESSAGE_CACHE_TTL } from '../shared/message-cache.js';
 
-export interface ChannelScope { parentId: string | null; containerId: string | null }
+export interface ChannelScope { parentId: string | null; containerId: string | null; name?: string }
 export interface MemberSnapshot { nickname: string | null; roles: string[]; label: string }
 interface CollectorContext {
   guildId: string;
@@ -15,29 +17,40 @@ interface CollectorContext {
   emit(event: Observation): void;
   missingMemberBaseline(): void;
 }
-type MessageSnapshot = {
-  authorId: string | null; authorName: string | null; content: string | null; contentTruncated: boolean;
-  attachments: { id: string; name: string }[] | null; attachmentsTruncated: boolean;
-};
 const emptyMessage = (): MessageSnapshot => ({ authorId: null, authorName: null, content: null, contentTruncated: false, attachments: null, attachmentsTruncated: false });
-export const MESSAGE_CACHE_LIMIT = 1000;
-export const MESSAGE_CACHE_TTL = 30 * 60 * 1000;
 
-/** Raw dispatch runs before discord.js updates its member/voice caches. No REST lookups or disk archive. */
+/** Raw dispatch runs before discord.js updates its member/voice caches. Persistence is batched separately. */
 export class ActivityCollector {
-  private messages = new Map<string, { snapshot: MessageSnapshot; savedAt: number; channelId: string }>();
+  private messages = new Map<string, MessageCacheEntry>();
   private policy: LoggingSettings | null = null;
   constructor(private context: CollectorContext, private now: () => number = Date.now) {}
   get cachedMessages() { return this.messages.size; }
   clear() { this.messages.clear(); }
+  messageEntries() { this.syncPolicy(); return new Map(this.messages); }
+  restoreMessages(entries: MessageCacheEntry[]) {
+    this.syncPolicy();
+    for (const entry of [...entries].sort((a, b) => a.savedAt - b.savedAt)) {
+      if (entry.savedAt > this.now() || this.now() - entry.savedAt >= MESSAGE_CACHE_TTL || this.messages.has(entry.id)) continue;
+      if (this.scope('message.edited', entry.id, entry.channelId) || this.scope('message.deleted', entry.id, entry.channelId)) this.messages.set(entry.id, entry);
+    }
+    while (this.messages.size > MESSAGE_CACHE_LIMIT) this.messages.delete(this.messages.keys().next().value!);
+  }
   syncPolicy() {
-    const next = this.context.settings();
-    if (next !== this.policy) { this.clear(); this.policy = next; }
-    for (const [id, entry] of this.messages) if (this.now() - entry.savedAt >= MESSAGE_CACHE_TTL) this.messages.delete(id);
+    this.policy = this.context.settings();
+    if (!this.policy) { this.clear(); return; }
+    for (const [id, entry] of this.messages) {
+      const scope = this.scope('message.edited', id, entry.channelId) ?? this.scope('message.deleted', id, entry.channelId);
+      if (!scope || this.now() - entry.savedAt >= MESSAGE_CACHE_TTL) this.messages.delete(id);
+      else if (scope.parentId !== entry.parentId || scope.containerId !== entry.containerId) {
+        this.messages.set(id, { ...entry, parentId: scope.parentId, containerId: scope.containerId });
+      }
+    }
   }
   private remember(id: string, channelId: string, snapshot: MessageSnapshot) {
+    const scope = this.context.channel(channelId);
+    if (!scope) return;
     this.messages.delete(id);
-    this.messages.set(id, { snapshot, savedAt: this.now(), channelId });
+    this.messages.set(id, { id, snapshot, savedAt: this.now(), channelId, parentId: scope.parentId, containerId: scope.containerId });
     while (this.messages.size > MESSAGE_CACHE_LIMIT) this.messages.delete(this.messages.keys().next().value!);
   }
   private messageSnapshot(data: GatewayMessageUpdateDispatchData, previous?: MessageSnapshot): MessageSnapshot {
@@ -59,8 +72,9 @@ export class ActivityCollector {
   private emit(type: string, subjectId: string, channelId: string | null, label: string, before: Record<string, unknown> | null, after: Record<string, unknown> | null, sourceKey: string) {
     const scope = this.scope(type, subjectId, channelId);
     if (!scope) return;
+    const channelName = scope.name ? { channelName: scope.name.slice(0, 100) } : {};
     this.context.emit({ guildId: this.context.guildId, type, subjectId, channelId, parentId: scope.parentId, label: label.slice(0, 200),
-      before: before ? { ...before, containerId: scope.containerId } : null, after: after ? { ...after, containerId: scope.containerId } : null,
+      before: before ? { ...before, ...channelName, containerId: scope.containerId } : null, after: after ? { ...after, ...channelName, containerId: scope.containerId } : null,
       observedAt: new Date(this.now()).toISOString(), sourceKey });
   }
   handle(packet: GatewayDispatchPayload, sourceKey: string) {

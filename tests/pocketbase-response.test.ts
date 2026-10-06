@@ -63,3 +63,7 @@ it('requires upgraded hooks instead of silently returning to the old polling bud
   await expect(adapter().scope('guild').initialize('Test', [])).rejects.toThrow('Update the PocketBase storage hooks');
   expect(fetch).toHaveBeenCalledTimes(1);
 });
+it('refuses hooks that would silently ignore persistent message snapshots', async () => {
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: { protocol: 1, trafficProtocol: 1, secretsProtocol: 1 } }))));
+  await expect(adapter().scope('guild').ready()).rejects.toThrow('message cache protocol 1 required');
+});

@@ -14,6 +14,7 @@ export class GuildStore {
     const status = await this.call('ready', {});
     if (status?.trafficProtocol !== 1) throw new Error('Update the PocketBase storage hooks before starting this version (traffic protocol 1 required).');
     if (status.secretsProtocol !== 1) throw new Error('Update PocketBase hooks and migrations before starting this version (secrets protocol 1 required).');
+    if (status.messageCacheProtocol !== 1) throw new Error('Update PocketBase storage hooks before starting this version (message cache protocol 1 required).');
   }
   async initialize(displayName: string, modules: ModuleDefinition[]) { await this.ready(); await this.call('initialize', { displayName, modules: modules.map(m => ({ id: m.manifest.id, settings: m.defaultSettings, settingsVersion: m.manifest.settingsVersion })) }); for (const module of modules) await upgradeSettings(this, module); }
   secrets(module: ModuleDefinition) { return new ModuleSecrets(this, module); }

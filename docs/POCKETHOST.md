@@ -1,6 +1,6 @@
 # PocketHost deployment guide
 
-Last checked: 2026-10-01. Locally tested PocketBase version: **0.40.4**. Storage protocol: **1**, with **trafficProtocol: 1** and **secretsProtocol: 1** required by the module-secret client release.
+Last checked: 2026-10-06. Locally tested PocketBase version: **0.40.4**. Current clients require storage capabilities **trafficProtocol: 1**, **secretsProtocol: 1**, and **messageCacheProtocol: 1** alongside storage protocol **1**.
 
 PocketHost documents SFTP access to `pb_hooks` and `pb_migrations` and Secrets exposed in the PocketBase runtime. These capabilities support this adapter on a normal hosted instance without a custom binary. Account-specific deployment has not been performed.
 
@@ -24,7 +24,7 @@ PocketHost stores data; the Discord Gateway connection and Fastify dashboard run
    - `OMO_STORAGE_KEY`: the storage key (64 hex characters).
    - `OMO_GUILD_ID`: the exact Discord guild snowflake.
 4. Run `pnpm pocketbase:bundle`. It creates `dist/pockethost/pb_hooks`, `dist/pockethost/pb_migrations`, and a checksum manifest.
-5. Upload the **contents** of those two directories into the instance's corresponding directories via SFTP or phio. Keep the layout flat: `pb_hooks/000_omo_headless.pb.js`, `pb_hooks/omo.pb.js`, `pb_hooks/operations.js`, `pb_hooks/installation.js`, `pb_migrations/1790265600_omo_storage.js`, `pb_migrations/1790265601_instance_binding.js`, and `pb_migrations/1790265602_module_resources.js`. Do not upload `.env`, `.local`, `node_modules`, or any local `pb_data`.
+5. Upload the **contents** of those two directories into the instance's corresponding directories via SFTP or phio. Keep the layout flat: `pb_hooks/000_omo_headless.pb.js`, `pb_hooks/omo.pb.js`, `pb_hooks/operations.js`, `pb_hooks/message-cache.js`, `pb_hooks/installation.js`, `pb_migrations/1790265600_omo_storage.js`, `pb_migrations/1790265601_instance_binding.js`, `pb_migrations/1790265602_module_resources.js`, and `pb_migrations/1790851200_module_secrets.js`. Do not upload `.env`, `.local`, `node_modules`, or any local `pb_data`.
 6. Restart the instance using PocketHost controls so committed migrations execute. Their initial rollback intentionally refuses automatic table deletion; restore a verified backup for a destructive rollback.
 
 PocketHost's documented SFTP settings are host `ftp.pockethost.io`, port `2222`, username your account email, and an Ed25519 key registered under Account → Keys. Scope the key to the target instance. The service provides SFTP, not a remote shell. Use the current PocketHost docs for connection details and key verification.
@@ -82,11 +82,11 @@ The dashboard shares one authenticated workspace snapshot per minute across over
 
 Measured in `tests/pockethost-budget.test.ts` through the production adapter, worker cycle, logging delivery and Fastify/Auth, using simulated time and HTTP responses:
 
-- One module, idle hour including startup/shutdown: **325 requests**.
-- Two installed modules, idle hour including startup/shutdown: **328 requests**. Recurring cost stays the same; startup has three more requests.
-- Two modules, 100 separately captured/delivered changes spread across 50 minutes, one overview open for the full hour: **912 requests**, peak **27 in a rolling 10-second window**.
+- One module, idle hour including startup/shutdown: **326 requests**.
+- Two installed modules, idle hour including startup/shutdown: **329 requests**. Recurring cost stays the same; startup has three more requests.
+- Two modules, 100 separately captured/delivered changes spread across 50 minutes, one overview open for the full hour: **913 requests**, peak **28 in a rolling 10-second window**.
 
-These are measured test workloads, not live PocketHost capacity certification. They include 180 lease renewals, 120 polls, 12 maintenance catalog refreshes plus startup, one core/logging cleanup each, dashboard authorization and 59 membership refresh writes. Failures, retries, interactive navigation, explicit refreshes, external health monitors, more viewers, generic module records/jobs and bursts add requests. An hourly average does not protect against a burst cap. Ordinary new chat messages remain memory-only and do not consume event storage requests.
+These are measured test workloads, not live PocketHost capacity certification. They include 180 lease renewals, 120 polls, 12 maintenance catalog refreshes plus startup, one core/logging cleanup each, dashboard authorization and 59 membership refresh writes. Failures, retries, interactive navigation, explicit refreshes, external health monitors, more viewers, generic module records/jobs and bursts add requests. An hourly average does not protect against a burst cap. Ordinary new chat messages are saved as temporary snapshots in existing worker polls; they do not create event-storage requests. These totals include one startup read for an empty persistent cache; a full cache adds up to nine more reads.
 
 For busier servers, use PocketHost's supported trusted-IP option or request a larger operator-configured budget, or self-host PocketBase near the bot. Trusted IPs need a stable egress address and account configuration; do not spoof client-IP headers or rotate addresses to evade limits. PostgreSQL remains supported. No automatic data migration or provider fallback occurs.
 
@@ -105,3 +105,10 @@ If the client deploy fails, the previous client can run against the upgraded hoo
 ## Additional upgrade for dashboard-managed secrets
 
 The module-secret release adds `pb_migrations/1790851200_module_secrets.js` and changes `pb_hooks/operations.js` again. The hook-only steps above describe the earlier request-budget commit 49650dc, not this later release. Upload the new migration and matching hooks, apply/restart, and verify `ready.secretsProtocol === 1` before deploying secret-capable clients. Existing schema, bindings and data are retained. Configure the same separate `MODULE_SECRET_ENCRYPTION_KEY` on bot/web; never put it in the database or give it to the browser. See [MODULE_SECRETS.md](MODULE_SECRETS.md). Production rollout has not been performed.
+
+
+## Persistent message cache update
+
+The 2026-10-06 update adds `pb_hooks/message-cache.js` and updates `pb_hooks/operations.js`. Generate the bundle with `pnpm pocketbase:bundle` and install both matching hooks before deploying the new bot/dashboard. Use the existing maintenance/atomic-replacement workflow; the first-install wizard is not an upgrade tool. Readiness must advertise `messageCacheProtocol: 1` as well as the existing capabilities. No new migration, service key, or encryption key is required; snapshots use the existing guild-scoped module-record table. Old clients remain compatible with the updated hooks.
+
+The cache stores up to 5,000 message snapshots for 24 hours. Writes ride on workerPoll, up to 100 snapshots/512 KiB per poll; they add no separate recurring HTTP requests. Startup restores pages of 500 (up to ten requests), and graceful shutdown may send extra polls to flush pending batches. Bursts can create a multi-poll backlog; crashes can lose unflushed updates. The normal 30-second PocketHost poll interval remains. This is bounded recent-message coverage, not an archive or recovery of messages the bot never observed. See [logging retention](LOGGING.md#message-content-and-retention).
